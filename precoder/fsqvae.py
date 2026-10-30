@@ -1,0 +1,436 @@
+"""
+Finite Scalar Quantization: VQ-VAE Made Simple - https://arxiv.org/abs/2309.15505
+Code for FSQ() drawn from vector-quantize-pytorch repository
+"""
+
+from __future__ import annotations
+import sys
+from functools import wraps, partial
+from contextlib import nullcontext
+from typing import List, Tuple
+
+import torch
+import torch.nn as nn
+from torch.nn import Module
+from torch import tensor, Tensor, int32, tanh, atanh, clamp
+from torch.amp import autocast
+from torch.nn.utils import parametrize
+
+from einops import rearrange, pack, unpack
+
+import random
+
+from enc_dec_modules import *
+
+# helper functions
+
+class UnitNormRows(nn.Module):
+    def forward(self, X):
+        # Normalize along dimension 1 (rows) with a small epsilon for stability
+        return torch.nn.functional.normalize(X, p=2, dim=1, eps=1e-12)
+
+def exists(v):
+    return v is not None
+
+def default(*args):
+    for arg in args:
+        if exists(arg):
+            return arg
+    return None
+
+def identity(t):
+    return t
+
+def maybe(fn):
+    @wraps(fn)
+    def inner(x, *args, **kwargs):
+        if not exists(x):
+            return x
+        return fn(x, *args, **kwargs)
+    return inner
+
+def pack_one(t, pattern):
+    return pack([t], pattern)
+
+def unpack_one(t, ps, pattern):
+    return unpack(t, ps, pattern)[0]
+
+# tensor helpers
+
+def round_ste(z):
+    """ round with straight through gradients. """
+    zhat = z.round()
+    return z + (zhat - z).detach()
+
+def floor_ste(z):
+    """ floor with straight through gradients. """
+    zhat = z.floor()
+    return z + (zhat - z).detach()
+
+# main class
+
+class FSQ(Module):
+    def __init__(
+        self,
+        levels: list[int] | tuple[int, ...],
+        dim: int | None = None,
+        num_codebooks = 1,
+        keep_num_codebooks_dim: bool | None = None,
+        scale: float | None = None,
+        allowed_dtypes: tuple[torch.dtype, ...] = (torch.float32, torch.float64),
+        channel_first = False,
+        projection_has_bias = True,
+        return_indices = True,
+        force_quantization_f32 = True,
+        preserve_symmetry = False,
+        noise_dropout = 0.,
+        bound_hard_clamp = False,                   # for residual fsq, if input is pre-softclamped to the right range
+        orthogonal_rotation = False,                # increase codebook utilization. ensure levels are symmetric! https://arxiv.org/abs/2307.13304v2
+        splice_latent = False,
+        get_quantized_splice = False
+    ):
+        super().__init__()
+
+        assert not (any([l == 2 for l in levels]) and not preserve_symmetry), 'turn on `preserve_symmetry` for using any levels == 2, or use a greater level'
+
+        if isinstance(levels, tuple):
+            levels = list(levels)
+
+        _levels = tensor(levels, dtype = int32)
+        self.register_buffer('_levels', _levels, persistent = False)
+
+        _basis = torch.cumprod(tensor([1] + levels[:-1]), dim = 0, dtype = int32)
+        self.register_buffer('_basis', _basis, persistent = False)
+
+        self.scale = scale
+        self.splice_latent = splice_latent
+        self.get_quantized_splice = get_quantized_splice
+
+        assert not (noise_dropout > 0 and not preserve_symmetry)
+        self.preserve_symmetry = preserve_symmetry
+        self.noise_dropout = noise_dropout
+
+        codebook_dim = len(levels)
+        self.codebook_dim = codebook_dim
+
+        effective_codebook_dim = codebook_dim * num_codebooks
+        self.num_codebooks = num_codebooks
+        self.effective_codebook_dim = effective_codebook_dim
+
+        keep_num_codebooks_dim = default(keep_num_codebooks_dim, num_codebooks > 1)
+        assert not (num_codebooks > 1 and not keep_num_codebooks_dim)
+        self.keep_num_codebooks_dim = keep_num_codebooks_dim
+
+        self.dim = default(dim, len(_levels) * num_codebooks)
+
+        self.channel_first = channel_first
+
+        has_projections = self.dim != effective_codebook_dim
+        self.project_in = nn.Linear(self.dim, effective_codebook_dim, bias = projection_has_bias) if has_projections else nn.Identity()
+        self.project_out = nn.Linear(effective_codebook_dim, self.dim, bias = projection_has_bias) if has_projections else nn.Identity()
+
+        self.has_projections = has_projections
+
+        self.return_indices = return_indices
+
+        if return_indices:
+            self.codebook_size = self._levels.prod().item()
+            implicit_codebook = self._indices_to_codes(torch.arange(self.codebook_size))
+            self.register_buffer('implicit_codebook', implicit_codebook, persistent = False)
+
+        self.allowed_dtypes = allowed_dtypes
+        self.force_quantization_f32 = force_quantization_f32
+
+        # allow for a hard clamp
+
+        self.bound_hard_clamp = bound_hard_clamp
+
+        self.orthogonal_rotation = orthogonal_rotation
+
+        if orthogonal_rotation:
+            is_symmetric = len(set(levels)) == 1
+            if not is_symmetric:
+                print('orthogonal_rotation is not recommended for FSQ with asymmetric levels (i.e. where the number of bins differ across dimensions)')
+
+            orthogonal_rot = torch.empty(codebook_dim, codebook_dim)
+            nn.init.orthogonal_(orthogonal_rot)
+            self.register_buffer('orthogonal_rot', orthogonal_rot)
+
+    def bound(self, z, eps = 1e-3, hard_clamp = False):
+        """ Bound `z`, an array of shape (..., d). """
+        maybe_tanh = tanh if not hard_clamp else partial(clamp, min = -1., max = 1.)
+        maybe_atanh = atanh if not hard_clamp else identity
+
+        half_l = (self._levels - 1) * (1 + eps) / 2
+        offset = torch.where(self._levels % 2 == 0, 0.5, 0.0)
+        shift = maybe_atanh(offset / half_l)
+        bounded_z = maybe_tanh(z + shift) * half_l - offset
+        half_width = self._levels // 2
+        if self.splice_latent and not self.get_quantized_splice:
+            return bounded_z / half_width
+        return round_ste(bounded_z) / half_width
+
+    # symmetry-preserving and noise-approximated quantization, section 3.2 in https://arxiv.org/abs/2411.19842
+
+    def symmetry_preserving_bound(self, z, hard_clamp = False):
+        """ QL(x) = 2 / (L - 1) * [(L - 1) * (tanh(x) + 1) / 2 + 0.5] - 1 """
+        maybe_tanh = tanh if not hard_clamp else partial(clamp, min = -1., max = 1.)
+
+        levels_minus_1 = (self._levels - 1)
+        scale = 2. / levels_minus_1
+        bracket = (levels_minus_1 * (maybe_tanh(z) + 1) / 2.) + 0.5
+        bracket = floor_ste(bracket)
+        return scale * bracket - 1.
+
+    def quantize(self, z):
+        """ Quantizes z, returns quantized zhat, same shape as z. """
+
+        shape, device, preserve_symmetry = z.shape[0], z.device, self.preserve_symmetry
+        bound_fn = self.symmetry_preserving_bound if preserve_symmetry else self.bound
+
+        return bound_fn(z, hard_clamp = self.bound_hard_clamp)
+
+    def maybe_apply_noise(self, bounded_z):
+        noise_dropout = self.noise_dropout
+
+        if not self.training or noise_dropout == 0.:
+            return bounded_z
+
+        # determine where to add a random offset elementwise
+        # if using noise dropout
+
+        offset_mask = torch.full_like(bounded_z, noise_dropout).bernoulli_().bool()
+        offset = torch.rand_like(bounded_z) - 0.5
+
+        bounded_z = torch.where(offset_mask, bounded_z + offset, bounded_z)
+
+        return bounded_z.clamp(-1., 1.)
+
+    def _scale_and_shift(self, zhat_normalized):
+        if self.preserve_symmetry:
+            return (zhat_normalized + 1.) / (2. / (self._levels - 1))
+
+        half_width = self._levels // 2
+        return (zhat_normalized * half_width) + half_width
+
+    def _scale_and_shift_inverse(self, zhat):
+        if self.preserve_symmetry:
+            return zhat * (2. / (self._levels - 1)) - 1.
+
+        half_width = self._levels // 2
+        return (zhat - half_width) / half_width
+
+    def _indices_to_codes(self, indices):
+        level_indices = self.indices_to_level_indices(indices)
+        codes = self._scale_and_shift_inverse(level_indices)
+        return codes
+
+    def indices_to_level_indices(self, indices):
+        """ Converts indices to indices at each level, perhaps needed for a transformer with factorized embeddings """
+        indices = rearrange(indices, '... -> ... 1')
+        codes_non_centered = (indices // self._basis) % self._levels
+        return codes_non_centered
+
+    def codes_to_indices(self, zhat):
+        """ Converts a `code` to an index in the codebook. """
+        assert zhat.shape[-1] == self.codebook_dim
+        zhat = self._scale_and_shift(zhat)
+        return (zhat * self._basis).sum(dim = -1).round().to(int32)
+
+    def indices_to_codes(self, indices):
+        """ Inverse of `codes_to_indices`. """
+        assert exists(indices)
+
+        is_img_or_video = indices.ndim >= (3 + int(self.keep_num_codebooks_dim))
+
+        codes = self._indices_to_codes(indices)
+
+        if self.orthogonal_rotation:
+            codes = codes @ self.orthogonal_rot.t()
+
+        if self.keep_num_codebooks_dim:
+            codes = rearrange(codes, '... c d -> ... (c d)')
+
+        codes = self.project_out(codes)
+
+        if is_img_or_video or self.channel_first:
+            codes = rearrange(codes, 'b ... d -> b d ...')
+
+        return codes
+
+    def forward(self, z):
+        """
+        einstein notation
+        b - batch
+        n - sequence (or flattened spatial dimensions)
+        d - feature dimension
+        c - number of codebook dim
+        """
+
+        is_img_or_video = z.ndim >= 4
+        need_move_channel_last = is_img_or_video or self.channel_first
+
+        # standardize image or video into (batch, seq, dimension)
+
+        if need_move_channel_last:
+            z = rearrange(z, 'b d ... -> b ... d')
+            z, ps = pack_one(z, 'b * d')
+
+        assert z.shape[-1] == self.dim, f'expected dimension of {self.dim} but found dimension of {z.shape[-1]}'
+
+        z = self.project_in(z)
+
+        z = rearrange(z, 'b n (c d) -> b n c d', c = self.num_codebooks)
+
+        if self.orthogonal_rotation:
+            z = z @ self.orthogonal_rot
+
+        # whether to force quantization step to be full precision or not
+
+        force_f32 = self.force_quantization_f32
+        quantization_context = partial(autocast, 'cuda', enabled = False) if force_f32 else nullcontext
+
+        with quantization_context():
+            orig_dtype = z.dtype
+
+            if force_f32 and orig_dtype not in self.allowed_dtypes:
+                z = z.float()
+
+            codes = self.quantize(z)
+            if self.splice_latent:
+                return codes, None
+
+            # returning indices could be optional
+
+            indices = None
+
+            if self.return_indices:
+                indices = self.codes_to_indices(codes)
+
+            codes = self.maybe_apply_noise(codes)
+
+            if self.orthogonal_rotation:
+                codes = codes @ self.orthogonal_rot.t()
+
+            codes = rearrange(codes, 'b n c d -> b n (c d)')
+
+            codes = codes.to(orig_dtype)
+
+        # project out
+
+        out = self.project_out(codes)
+
+        # reconstitute image or video dimensions
+
+        if need_move_channel_last:
+            out = unpack_one(out, ps, 'b * d')
+            out = rearrange(out, 'b ... d -> b d ...')
+
+            indices = maybe(unpack_one)(indices, ps, 'b * c')
+
+        if not self.keep_num_codebooks_dim and self.return_indices:
+            indices = maybe(rearrange)(indices, '... 1 -> ...')
+
+        # return quantized output and indices
+
+        return out, indices
+
+#
+#
+class FSQVAE(nn.Module):
+    def __init__(self, conf, network_conf, splice_latent=False, get_quantized_splice=False, do_simple_bound=False):
+        """
+        Params (in conf): 
+            ut_encoder_layer_config: config dict for TransformerEncoderLayer at UT
+            ut_encoder_config: config dict for TransformerEncoder at UT
+            bs_encoder_layer_config: config dict for TransformerEncoderLayer at BS
+            bs_encoder_config: config dict for TransformerEncoder at BS
+
+            unquantized_latent_dim: dimensionality of the full latent space
+            num_levels: number of bins into which the quantized outputs are placed
+
+        splice_latent: Get the unquantized latent representation. Returns immediately 
+                       to the calling function without completing the forward pass.
+        get_quantized_splice: If splice_latent==True
+        """
+        super().__init__()
+
+        # config dictionaries for transformer heads
+        ut_encoder_layer_config = conf['ut_encoder_layer_config']
+        bs_encoder_layer_config = conf['bs_encoder_layer_config']
+        bs_encoder_config = conf['bs_encoder_config']
+
+        # parameters for embedding
+        self.levels = conf['levels']
+        self.unquantized_latent_dim = len(self.levels)
+        self.splice_latent = splice_latent
+        self.get_quantized_splice = get_quantized_splice
+        if not self.splice_latent:
+            self.get_quantized_splice = False
+        
+        # network parameters
+        self.N, self.J = network_conf['N'], network_conf['J']
+        self.Td = network_conf['Td']
+        self.use_dft_matrix = network_conf['use_dft_matrix']
+
+        self.relu = nn.ReLU()
+        self.gelu = nn.GELU()
+        self.leaky = nn.LeakyReLU(negative_slope=0.1)
+
+        # everything for the UTs
+        self.dm_ut = ut_encoder_layer_config['d_model'] 
+
+        self.encoder_seq = nn.Sequential(nn.Linear(2*self.Td, 2*self.dm_ut),
+                                         self.relu,
+                                         nn.Linear(2*self.dm_ut, 2*self.dm_ut),
+                                         self.relu,
+                                         nn.Linear(2*self.dm_ut, 1*self.dm_ut),
+                                         self.relu,
+                                         nn.Linear(1*self.dm_ut, self.unquantized_latent_dim))
+
+        # everything for the BS
+        self.fsq = FSQ(self.levels, return_indices=False, orthogonal_rotation=False, 
+                       splice_latent=splice_latent, get_quantized_splice=self.get_quantized_splice)
+
+        # make the final output for the normalizing flow
+        self.dm_bs = bs_encoder_layer_config['d_model']
+        self.dec_ff_d_model = nn.Linear(self.unquantized_latent_dim, self.dm_bs)
+        self.dec_pos_encoding = PositionalEncoding(d_model=self.dm_bs,
+                                                   max_len=self.J)
+        self.decoder = EncoderHead(bs_encoder_layer_config, 
+                                   bs_encoder_config, 
+                                   self.dec_pos_encoding)
+        self.dec_ff_to_2N = nn.Linear(self.dm_bs, 2*self.N)
+
+        if self.use_dft_matrix:
+            self.pilot_matrix = network_conf['pilot_matrix']
+        else:
+            self.pilot_matrix = nn.Parameter(torch.randn((self.Td, self.N), dtype=torch.cfloat), requires_grad=True)
+            parametrize.register_parametrization(self, "pilot_matrix", UnitNormRows())
+        
+    def quantize(self, z):
+        return self.fsq(z)
+    
+    def forward(self, obs):
+        H, noise = obs
+        Y = self.pilot_matrix @ (H.conj()) + noise
+        Y = torch.cat([Y.real, Y.imag], dim=-2).requires_grad_(True) # B x 2Td x J
+
+        yy = Y.contiguous()
+        bs = yy.shape[0]
+
+        x = self.encoder_seq(yy.permute(0,2,1).reshape(-1, 2*self.Td)).unsqueeze(1) # JB x 1 x unquant_latent_dim
+
+        # quantize the latent space
+        x_quantized, x_quant_indices = self.quantize(x) # JB x 1 x unquant_latent_dim
+        if self.splice_latent:
+            return x_quantized, None
+
+        x_quantized = x_quantized.reshape(bs, self.J, -1) # B x J x unquant_latent_dim
+        z = self.dec_ff_d_model(x_quantized) # B x J x d_model_bs
+        x_recon = self.decoder(self.relu(z), src_key_padding_mask=None) # B x J x d_model_bs
+        x_recon = self.dec_ff_to_2N(self.relu(x_recon)) # B x J x 2N
+        # normalize each matrix to have unit norm to satisfy power constraint
+        x_recon = x_recon / torch.linalg.matrix_norm(x_recon, ord='fro', keepdim=True)
+
+        return x_recon, x_quant_indices

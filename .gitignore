@@ -1,0 +1,18 @@
+# generated data (make_channels.py)
+channel_data/
+deepmimo_scenarios/
+
+# experiment outputs (run_*.sh) -- regenerate with the run scripts, then analysis/aggregate_results.py
+results_fsq*/
+results_vq*/
+**/wmmse_results/
+**/centroids/
+**/tst_idxs/
+precoder/analysis/aggregated_results.pkl
+precoder/analysis/photos/
+
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
+.ipynb_checkpoints/

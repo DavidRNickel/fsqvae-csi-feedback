@@ -1,0 +1,13 @@
+# Tested with Python 3.12, torch 2.6, numpy 2.2, scipy 1.18, numba 0.61, scikit-learn 1.9,
+# einops 0.8, pandas 3.0, matplotlib 3.11, deepmimo 4.0.3
+torch
+numpy
+scipy
+numba
+scikit-learn
+einops
+pandas
+matplotlib
+tqdm
+deepmimo
+setuptools  # provides distutils.util.strtobool on Python >= 3.12
